@@ -40,6 +40,7 @@
 #include <ostream>
 #include <vector>
 #include <array>
+#include <algorithm>
 
 #include <cstdlib>
 #include <cmath>
@@ -73,6 +74,31 @@ namespace OpenBabel
         return 0x800 | ((Red & 0x1F) << 10) | ((Green & 0x1F) << 5) | (Blue & 0x1F);
       };
 
+      /**
+       * @brief Non-standard STL value for no color for triangle face.
+       */
+      static constexpr uint16_t NoColor{0};
+
+      /**
+       * @brief Default value for -xc option. (Unit: A)
+       */
+      static constexpr double DefaultProbeRadius{0.0};
+
+      /**
+       * @brief Default scaling factor for -xs option.
+       */
+      static constexpr double DefaultScalingFactor{1.0};
+
+      /**
+       * @brief Default bond radius for --bond-radius option. (Unit: A)
+       */
+      static constexpr double DefaultBondRadius{0.5};
+
+      /**
+       * @brief Default bond spacing for --bond-spacing option. (Unit: A)
+       */
+      static constexpr double DefaultBondSpacing{0.1};
+
     public:
       STLFormat()
       {
@@ -82,6 +108,8 @@ namespace OpenBabel
         OBConversion::RegisterOptionParam("s", this, 1, OBConversion::OUTOPTIONS);
         OBConversion::RegisterOptionParam("c", this, 1, OBConversion::OUTOPTIONS);
         */
+        OBConversion::RegisterOptionParam("bond-size", this, 1, OBConversion::GENOPTIONS);
+        OBConversion::RegisterOptionParam("bond-radius", this, 1, OBConversion::GENOPTIONS);
       }
 
       /// Return description.
@@ -92,8 +120,12 @@ namespace OpenBabel
           "The STereoLithography format developed by 3D Systems\n\n"
           "Write Options, e.g. -xc\n"
           "  p <radius> radius for probe particle (default 0.0 A)\n"
-          "  s <scale> scale-factor for VDW radius (default 1.0 A)\n"
-          "  c add CPK colours\n\n";
+          "  s <scale> scale-factor for VDW radius and bond radius/spacing (default 1.0)\n"
+          "  c add CPK colours\n"
+          "  b draw bonds\n"
+          "General options,\n"
+          "  --bond-radius <radius> radius for bond visualization (default: 0.5 A)\n"
+          "  --bond-spacing <spacing> spacing between bond visualizations (default: 0.1 A)\n\n";
       }
 
       const char* SpecificationURL() override
@@ -138,6 +170,50 @@ namespace OpenBabel
     }
   };
 
+  /**
+   * @brief Helper struct containing the necessary information to visualize
+   *        a bond between two atoms.
+   */
+  struct StlBondModelInfo {
+    /**
+     * @brief radius of the cylinder visualizing a single bond (Unit: Angstrom).
+     *        Scales with the scale factor.
+     */
+    double radius;
+
+    /**
+     * @brief spacing between two bonds - only relevant for bond order > 1 (Unit: Angstrom).
+     *        Scales with the scale factor.
+     */
+    double spacing;
+
+    /**
+     * @brief origin of the bond - e.g. the position of one of the two bonding atoms.
+     */
+    vector3 origin;
+
+    /**
+     * @brief direction and length of the bond in 3D space.
+     */
+    vector3 direction_and_length;
+
+    /**
+     * @brief colour for the first half of the bond - for example CPK colour of the start atom.
+     */
+    uint16_t first_half_colour;
+
+    /**
+     * @brief colour for the second half of the bond - for example CPK colour of the end atom.
+     */
+    uint16_t second_half_colour;
+
+    /**
+     * @brief order of the bond - see OBBond for more information.
+     *        For visualization purposes this value is clamped between [1, 4].
+     */
+    unsigned int order;
+  };
+
   static void map_sphere ( vector<Triangle> &triangles, vector3 origin, double r, uint16_t col )
   {
     static constexpr std::size_t LongitudeSteps{ 144 };
@@ -170,6 +246,75 @@ namespace OpenBabel
       else {
         triangles.emplace_back(points[i+2], points[i+1], points[i], col);
       }
+    }
+  }
+
+  static void map_cylinder(vector<Triangle> &out, vector3 cylinder_origin,
+                           vector3 cylinder_direction_and_length, double radius,
+                           uint16_t color) {
+    static constexpr uint32_t QuadsPerCylinder{128};
+    static constexpr double AngleIncrease{2.0 * M_PI / QuadsPerCylinder};
+
+    // plane for the two circles at the top and bottom of the cylinder
+    vector3 plane_v0{};
+    cylinder_direction_and_length.createOrthoVector(plane_v0);
+
+    vector3 plane_v1 = cross(plane_v0, cylinder_direction_and_length);
+    plane_v1.normalize();
+
+    // remember 2 points as the starting point of the quad
+    vector3 base_point = cylinder_origin + radius * plane_v1;
+    vector3 top_point = base_point + cylinder_direction_and_length;
+    double angle = 0.0;
+
+    for (uint32_t i = 0; i < QuadsPerCylinder; ++i) {
+      // compute the 2 next points along the top and bottom circle
+      angle += AngleIncrease;
+      vector3 next_base_point = cylinder_origin +
+                                radius * sin(angle) * plane_v0 +
+                                radius * cos(angle) * plane_v1;
+      vector3 next_top_point = next_base_point + cylinder_direction_and_length;
+
+      // create quad (2 triangles) from previous and next points
+      // note the point order in order to obey the 'right-hand rule'
+      out.emplace_back(next_base_point, top_point, base_point, color);
+      out.emplace_back(top_point, next_top_point, next_base_point, color);
+
+      // remember next points
+      base_point = next_base_point;
+      top_point = next_top_point;
+    }
+  }
+
+  static void model_bond(vector<Triangle>& out, const StlBondModelInfo& bond)
+  {
+    const vector3 half_bond_vector = bond.direction_and_length * 0.5;
+    const bool same_colour = (bond.first_half_colour == bond.second_half_colour);
+
+    // compute how to shift bond visualizations in case of bond order > 1
+    vector3 bond_plane_vector{};
+    bond.direction_and_length.createOrthoVector(bond_plane_vector);
+    const vector3 bond_visualization_offset = (2 * bond.radius + bond.spacing) * bond_plane_vector;
+  
+    // compute origin of the first bond visualization depending on the bond order
+    const unsigned int order = max(unsigned(1), min(unsigned(4), bond.order));
+    const double offset_from_spacing = (order - 1) * bond.spacing * 0.5;
+    const double offset_from_bond_visualizations = (order - 1) * bond.radius;
+    vector3 origin = bond.origin - (offset_from_bond_visualizations + offset_from_spacing) * bond_plane_vector;
+  
+    // draw as many bond visualizations as the bond order dictates
+    for (uint32_t i = 0; i < order; ++i) {
+      // colour the bond depending on the first/second half colour
+      // if both colours are the same only make one cylinder in order to reduce the triangle count
+      if (same_colour) {
+        map_cylinder(out, origin, bond.direction_and_length, bond.radius,
+                     bond.first_half_colour);
+      } else {
+        map_cylinder(out, origin, half_bond_vector, bond.radius, bond.first_half_colour);
+        map_cylinder(out, origin + half_bond_vector, half_bond_vector, bond.radius,
+                     bond.second_half_colour);
+      }
+      origin += bond_visualization_offset;
     }
   }
 
@@ -248,10 +393,14 @@ namespace OpenBabel
 
     ostream& os = *pConv->GetOutStream();
 
-    double probe_radius = 0.;
-    double scale_factor = 1.;
-    uint16_t col = 0x0; // no colour colour
-    bool cpk_colours = (pConv->IsOption("c") != nullptr);
+    double probe_radius{DefaultProbeRadius};
+    double scale_factor{DefaultScalingFactor};
+    double bond_radius{DefaultBondRadius};
+    double bond_spacing{DefaultBondSpacing};
+    uint16_t col{NoColor};
+
+    bool cpk_colours{pConv->IsOption("c") != nullptr};
+    bool draw_bonds{pConv->IsOption("b") != nullptr};
 
     if( pConv->IsOption( "p" ) ) {
       probe_radius = atof( pConv->IsOption("p", OBConversion::OUTOPTIONS) );
@@ -261,13 +410,43 @@ namespace OpenBabel
       scale_factor = atof( pConv->IsOption("s", OBConversion::OUTOPTIONS) );
       if( !isfinite(scale_factor) || scale_factor < 0. ) { scale_factor = 0.; }
     }
-
+    if (pConv->IsOption("bond-radius", OBConversion::GENOPTIONS)) {
+      bond_radius = atof(pConv->IsOption("bond-radius", OBConversion::GENOPTIONS));
+      if (!isfinite(bond_radius) || bond_radius < 0.) { bond_radius = 0.; }
+    }
+    if (pConv->IsOption("bond-spacing", OBConversion::GENOPTIONS)) {
+      bond_spacing = atof(pConv->IsOption("bond-spacing", OBConversion::GENOPTIONS));
+      if (!isfinite(bond_spacing) || bond_spacing < 0.) { bond_spacing = 0.; }
+    }
 
     vector<Triangle> triangles;
     FOR_ATOMS_OF_MOL(a, *pmol) {
       const double vdwrad = scale_factor * OBElements::GetVdwRad( a->GetAtomicNum() ) + probe_radius;
-      col = (cpk_colours) ? cpk_colour(  a->GetAtomicNum() ) : col;
+      col = (cpk_colours) ? cpk_colour(  a->GetAtomicNum() ) : NoColor;
       map_sphere( triangles, a->GetVector(), vdwrad, col );
+    }
+
+    if (draw_bonds) {
+      // pre-scale bond radius and spacing
+      bond_radius *= scale_factor;
+      bond_spacing *= scale_factor;
+
+      FOR_BONDBFS_OF_MOL(b, *pmol) {
+        const OBAtom& begin = *b->GetBeginAtom();
+        const OBAtom& end = *b->GetEndAtom();
+
+        StlBondModelInfo bond_info{
+          .radius = bond_radius,
+          .spacing = bond_spacing,
+          .origin = begin.GetVector(),
+          .direction_and_length = (end.GetVector() - begin.GetVector()),
+          .first_half_colour = (cpk_colours) ? cpk_colour(begin.GetAtomicNum()) : NoColor,
+          .second_half_colour = (cpk_colours) ? cpk_colour(end.GetAtomicNum()) : NoColor,
+          .order = b->GetBondOrder()
+        };
+
+        model_bond(triangles, bond_info);
+      }
     }
 
     output_stl ( os, triangles, cpk_colours );
