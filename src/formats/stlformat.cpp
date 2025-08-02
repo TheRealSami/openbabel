@@ -286,7 +286,7 @@ namespace OpenBabel
       if( !isfinite(probe_radius) || probe_radius < 0. ) { probe_radius = 0.; }
     }
     if( pConv->IsOption( "s" ) ) {
-      probe_radius = atof( pConv->IsOption("s", OBConversion::OUTOPTIONS) );
+      scale_factor = atof( pConv->IsOption("s", OBConversion::OUTOPTIONS) );
       if( !isfinite(scale_factor) || scale_factor < 0. ) { scale_factor = 0.; }
     }
     if( pConv->IsOption( "c" ) ) {
