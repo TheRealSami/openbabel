@@ -68,16 +68,22 @@ namespace OpenBabel
   class STLFormat : public OpenBabel::OBMoleculeFormat
   {
     public:
-      // Non-standard STL extension for colour: 5 bits per col, bit 15 set
-      template<uint8_t Red, uint8_t Green, uint8_t Blue> 
-      static constexpr uint16_t colour() {
-        return 0x800 | ((Red & 0x1F) << 10) | ((Green & 0x1F) << 5) | (Blue & 0x1F);
-      };
+      /**
+        * @brief Enumeration of supported non-standard color channel orders for STL.
+        *        See https://en.wikipedia.org/wiki/STL_(file_format)#Binary.
+        */
+      enum class ColourOrder : uint8_t { RedGreenBlue, BlueGreenRed };
 
+    public:
       /**
        * @brief Non-standard STL value for no color for triangle face.
        */
       static constexpr uint16_t NoColor{0};
+
+      /**
+       * @brief Default colour order.
+       */
+      static constexpr ColourOrder DefaultColourOrder{ ColourOrder::BlueGreenRed };
 
       /**
        * @brief Default value for -xc option. (Unit: A)
@@ -110,6 +116,7 @@ namespace OpenBabel
         */
         OBConversion::RegisterOptionParam("bond-size", this, 1, OBConversion::GENOPTIONS);
         OBConversion::RegisterOptionParam("bond-radius", this, 1, OBConversion::GENOPTIONS);
+        OBConversion::RegisterOptionParam("colour-order-rgb", this, 0, OBConversion::GENOPTIONS);
       }
 
       /// Return description.
@@ -125,7 +132,8 @@ namespace OpenBabel
           "  b draw bonds\n"
           "General options,\n"
           "  --bond-radius <radius> radius for bond visualization (default: 0.5 A)\n"
-          "  --bond-spacing <spacing> spacing between bond visualizations (default: 0.1 A)\n\n";
+          "  --bond-spacing <spacing> spacing between bond visualizations (default: 0.1 A)\n"
+          "  --colour-order-rgb export colours in red green blue (RGB) order (default: BGR order)\n\n";
       }
 
       const char* SpecificationURL() override
@@ -318,27 +326,36 @@ namespace OpenBabel
     }
   }
 
-  static uint16_t cpk_colour( unsigned int atomicnum ) {
-    // CPK colouring
-    switch( atomicnum ) {
-      case 1:  return STLFormat::colour<0x1F, 0x1F, 0x1F>(); // H, WHITE
-      case 6:  return STLFormat::colour<0x04, 0x04, 0x04>(); // C, (almost) BLACK
-      case 7:  return STLFormat::colour<0x12, 0x1A, 0x1F>(); // N, SKY BLUE
-      case 8:  return STLFormat::colour<0x1F, 0x00, 0x00>(); // O, RED
-      case 16: return STLFormat::colour<0x1F, 0x1F, 0x00>(); // S, YELLOW
-      case 15: return STLFormat::colour<0x1F, 0x00, 0x1F>(); // P, PURPLE
-      case 9:  return STLFormat::colour<0x00, 0x1F, 0x00>(); // F, LIGHT GREEN
-      case 17: return STLFormat::colour<0x00, 0x17, 0x00>(); // Cl, MEDIUM GREEN
-      case 35: return STLFormat::colour<0x00, 0x0F, 0x00>(); // Br, MEDIUM DARK GREEN
-      case 53: return STLFormat::colour<0x00, 0x07, 0x00>(); // I, DARK GREEN
-      case 26: // Fe
-      case 27: // Co
-      case 28: // Ni
-      case 29:	return STLFormat::colour<0x18, 0x18, 0x18>(); // Cu, Metals Silver
-      default:
-                return STLFormat::colour<0x08, 0x08, 0x08>(); // Default, grey
+  /**
+   * @brief Get STL compatible colour for the given atom based on the colours defined
+   *        in OBElements::GetRGB().
+   *        Note that colour in STL is a non-standard extension allocating 5 bits per
+   *        colour channel with bit 15 set to 1.
+   */
+  static uint16_t stl_colour( unsigned int atomicnum , STLFormat::ColourOrder order ) {
+    static constexpr uint8_t MaxColor{0x1F};
+    static constexpr uint8_t ColorChannelWidth{5};
+    static constexpr uint16_t Bit15SetTo1{0x800};
 
+    array<double, 3> colour{};
+    OBElements::GetRGB(atomicnum, &colour[0], &colour[1], &colour[2]);
+
+    // adjust channel order
+    if (order == STLFormat::ColourOrder::BlueGreenRed) {
+      std::swap(colour[0], colour[2]);
     }
+
+    // compress colour into 15 bits
+    uint16_t stl_color{0};
+    for (double channel : colour) {
+      uint8_t scaled_color = static_cast<uint8_t>(std::round(channel * MaxColor));
+      uint8_t clamped_color = std::min(scaled_color, MaxColor);
+
+      stl_color <<= ColorChannelWidth;
+      stl_color |= clamped_color;
+    }
+
+    return Bit15SetTo1 | stl_color;
   }
 
   static void write_stl_vector(ostream& out, const vector3& v) {
@@ -398,6 +415,7 @@ namespace OpenBabel
     double bond_radius{DefaultBondRadius};
     double bond_spacing{DefaultBondSpacing};
     uint16_t col{NoColor};
+    STLFormat::ColourOrder colour_order{DefaultColourOrder};
 
     bool cpk_colours{pConv->IsOption("c") != nullptr};
     bool draw_bonds{pConv->IsOption("b") != nullptr};
@@ -418,11 +436,14 @@ namespace OpenBabel
       bond_spacing = atof(pConv->IsOption("bond-spacing", OBConversion::GENOPTIONS));
       if (!isfinite(bond_spacing) || bond_spacing < 0.) { bond_spacing = 0.; }
     }
+    if (pConv->IsOption("colour-order-rgb", OBConversion::GENOPTIONS)) {
+      colour_order = STLFormat::ColourOrder::RedGreenBlue;
+    }
 
     vector<Triangle> triangles;
     FOR_ATOMS_OF_MOL(a, *pmol) {
       const double vdwrad = scale_factor * OBElements::GetVdwRad( a->GetAtomicNum() ) + probe_radius;
-      col = (cpk_colours) ? cpk_colour(  a->GetAtomicNum() ) : NoColor;
+      col = (cpk_colours) ? stl_colour(  a->GetAtomicNum(), colour_order ) : NoColor;
       map_sphere( triangles, a->GetVector(), vdwrad, col );
     }
 
@@ -440,8 +461,8 @@ namespace OpenBabel
           .spacing = bond_spacing,
           .origin = begin.GetVector(),
           .direction_and_length = (end.GetVector() - begin.GetVector()),
-          .first_half_colour = (cpk_colours) ? cpk_colour(begin.GetAtomicNum()) : NoColor,
-          .second_half_colour = (cpk_colours) ? cpk_colour(end.GetAtomicNum()) : NoColor,
+          .first_half_colour = (cpk_colours) ? stl_colour(begin.GetAtomicNum(), colour_order) : NoColor,
+          .second_half_colour = (cpk_colours) ? stl_colour(end.GetAtomicNum(), colour_order) : NoColor,
           .order = b->GetBondOrder()
         };
 
