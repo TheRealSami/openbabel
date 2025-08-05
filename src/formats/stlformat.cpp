@@ -456,15 +456,14 @@ namespace OpenBabel
         const OBAtom& begin = *b->GetBeginAtom();
         const OBAtom& end = *b->GetEndAtom();
 
-        StlBondModelInfo bond_info{
-          .radius = bond_radius,
-          .spacing = bond_spacing,
-          .origin = begin.GetVector(),
-          .direction_and_length = (end.GetVector() - begin.GetVector()),
-          .first_half_colour = (cpk_colours) ? stl_colour(begin.GetAtomicNum(), colour_order) : NoColor,
-          .second_half_colour = (cpk_colours) ? stl_colour(end.GetAtomicNum(), colour_order) : NoColor,
-          .order = b->GetBondOrder()
-        };
+        StlBondModelInfo bond_info{};
+        bond_info.radius = bond_radius;
+        bond_info.spacing = bond_spacing;
+        bond_info.origin = begin.GetVector();
+        bond_info.direction_and_length = (end.GetVector() - begin.GetVector());
+        bond_info.first_half_colour = (cpk_colours) ? stl_colour(begin.GetAtomicNum(), colour_order) : NoColor;
+        bond_info.second_half_colour = (cpk_colours) ? stl_colour(end.GetAtomicNum(), colour_order) : NoColor;
+        bond_info.order = b->GetBondOrder();
 
         model_bond(triangles, bond_info);
       }
